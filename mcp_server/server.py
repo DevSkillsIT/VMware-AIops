@@ -1046,6 +1046,29 @@ def vm_list_plans() -> list[dict]:
 
 
 def main() -> None:
-    """Run the MCP server over stdio."""
+    """Run the MCP server.
+
+    Transport is selected via the MCP_TRANSPORT environment variable:
+      - "stdio" (default): standard input/output, for local MCP clients
+      - "streamable-http": HTTP listener, for MCPHub / LiteLLM / remote clients
+
+    When using streamable-http, MCP_HOST and MCP_PORT control the listener
+    (defaults: 0.0.0.0:8870).
+    """
     logging.basicConfig(level=logging.INFO)
-    mcp.run(transport="stdio")
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+        mcp.settings.port = int(os.environ.get("MCP_PORT", "8870"))
+        mcp.settings.stateless_http = True
+        # Disable DNS rebinding protection for network-accessible deployment
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run(transport="stdio")
