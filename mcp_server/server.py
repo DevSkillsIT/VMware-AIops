@@ -307,7 +307,8 @@ def deploy_vm_from_ova(
     HTTP NFC lease. Optionally powers on and creates a baseline snapshot.
 
     Args:
-        ova_path: Local file path to the .ova file.
+        ova_path: Path of the .ova file on the MCP host. Must be inside
+            VMWARE_MCP_FILE_ROOT (default /var/lib/vmware-aiops/files); a relative path is taken under it. Anything else is refused.
         vm_name: Desired name for the new VM.
         datastore_name: Target datastore for the VM.
         network_name: Network to attach (default "VM Network").
@@ -504,7 +505,8 @@ def batch_deploy_from_spec(
     - Fallback: create empty VMs (optionally with ISO)
 
     Args:
-        spec_path: Path to the deploy.yaml specification file.
+        spec_path: Path of the deploy.yaml on the MCP host. Must be inside
+            VMWARE_MCP_FILE_ROOT (default /var/lib/vmware-aiops/files), as must any per-VM ova it names.
         target: Optional vCenter/ESXi target name from config.
     """
     si = _get_connection(target)
@@ -868,7 +870,8 @@ def vm_guest_upload(
 
     Args:
         vm_name: Target VM name.
-        local_path: Local file path to upload.
+        local_path: Source file on the MCP host. Must be a regular file inside
+            VMWARE_MCP_FILE_ROOT (default /var/lib/vmware-aiops/files); a relative path is taken under it. Anything else is refused.
         guest_path: Destination path inside the guest.
         username: Guest OS username (default "root").
         password: Guest OS password.
@@ -894,7 +897,8 @@ def vm_guest_download(
     Args:
         vm_name: Target VM name.
         guest_path: File path inside the guest to download.
-        local_path: Local destination path.
+        local_path: Destination on the MCP host. Must be inside
+            VMWARE_MCP_FILE_ROOT (default /var/lib/vmware-aiops/files); a relative path is taken under it. Anything else is refused.
         username: Guest OS username (default "root").
         password: Guest OS password.
         target: Optional vCenter/ESXi target name from config.
@@ -919,7 +923,9 @@ def vm_guest_provision(
 
     Step types:
       - exec:    {"type": "exec", "command": "apt-get install -y nginx"}
-      - upload:  {"type": "upload", "local_path": "/tmp/id_rsa.pub", "guest_path": "/root/.ssh/authorized_keys"}
+      - upload:  {"type": "upload", "local_path": "keys/id_rsa.pub", "guest_path": "/root/.ssh/authorized_keys"}
+                 local_path must be inside VMWARE_MCP_FILE_ROOT (default /var/lib/vmware-aiops/files);
+                 every upload path is checked before the first step runs.
       - service: {"type": "service", "name": "nginx", "action": "start"}
 
     Args:
@@ -935,7 +941,7 @@ def vm_guest_provision(
 
     Example:
         steps = [
-            {"type": "upload", "local_path": "~/.ssh/id_rsa.pub", "guest_path": "/root/.ssh/authorized_keys"},
+            {"type": "upload", "local_path": "keys/id_rsa.pub", "guest_path": "/root/.ssh/authorized_keys"},
             {"type": "exec", "command": "chmod 600 /root/.ssh/authorized_keys"},
             {"type": "exec", "command": "apt-get install -y nginx"},
             {"type": "service", "name": "nginx", "action": "enable"},

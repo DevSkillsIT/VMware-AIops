@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 import yaml
 from pyVmomi import vim
 
+from vmware_aiops.hostpaths import check_host_path
 from vmware_aiops.ops.inventory import (
     find_datastore_by_name,
     find_vm_by_name,
@@ -62,7 +63,8 @@ def _read_ovf_from_ova(ova_path: str) -> tuple[str, dict[str, int]]:
     disks: dict[str, int] = {}
     ovf_content = ""
 
-    with tarfile.open(ova_path, "r") as tar:
+    # Only inside VMWARE_MCP_FILE_ROOT; open the resolved path.
+    with tarfile.open(check_host_path(ova_path), "r") as tar:
         for member in tar.getmembers():
             if not _safe_tar_member(member):
                 _log.warning("Skipping unsafe tar member: %s", member.name)
@@ -88,7 +90,8 @@ def _upload_disk(
     disk_size: int,
 ) -> None:
     """Upload a VMDK from an OVA to the vSphere HTTP NFC lease URL."""
-    with tarfile.open(ova_path, "r") as tar:
+    # Opened again here: check again (the import ran in between).
+    with tarfile.open(check_host_path(ova_path), "r") as tar:
         member = tar.getmember(disk_name)
         if not _safe_tar_member(member):
             raise ValueError(f"Unsafe tar member path: {disk_name}")
@@ -153,6 +156,9 @@ def deploy_ova(
     Returns:
         Status message.
     """
+    # Refuse a host path outside VMWARE_MCP_FILE_ROOT before vCenter is touched.
+    check_host_path(ova_path)
+
     content = si.RetrieveContent()
 
     # Find datastore
@@ -669,7 +675,8 @@ def load_deploy_spec(spec_path: str) -> dict:
         ova: /path/to/image.ova       # Per-VM OVA override
     ```
     """
-    with open(spec_path) as f:
+    # Only inside VMWARE_MCP_FILE_ROOT; open the resolved path.
+    with open(check_host_path(spec_path)) as f:
         spec = yaml.safe_load(f)
 
     if not spec or "vms" not in spec:

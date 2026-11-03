@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from pyVmomi import vim
 
+from vmware_aiops.hostpaths import HostPathRefusedError, check_host_path
 from vmware_aiops.ops.inventory import find_vm_by_name
 
 if TYPE_CHECKING:
@@ -224,6 +226,28 @@ class Plan:
 # ---------------------------------------------------------------------------
 
 
+#: Exactly what _generate_plan_id produces: no dot, no slash, no NUL, so a plan
+#: id can never name a path outside the plans directory (upstream v2.3.2 fix).
+_PLAN_ID = re.compile(r"plan-[0-9]{8}-[0-9]{6}-[0-9a-f]{4}")
+
+#: Plan actions whose params name a file on this host, and which param it is.
+_HOST_PATH_PARAMS: dict[str, str] = {
+    "guest_upload": "local_path",
+    "guest_download": "local_path",
+    "deploy_ova": "ova_path",
+}
+
+
+def _plan_path(plan_id: str) -> Path:
+    """Return the plan file for ``plan_id``; refuse anything that is not a plan id."""
+    if not isinstance(plan_id, str) or not _PLAN_ID.fullmatch(plan_id):
+        raise ValueError(
+            f"Not a valid plan id: {str(plan_id)[:80]!r}. Use the plan_id that "
+            "vm_create_plan returned (vm_list_plans shows them)."
+        )
+    return _PLANS_DIR / f"{plan_id}.json"
+
+
 def _generate_plan_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     short = uuid.uuid4().hex[:4]
@@ -307,6 +331,14 @@ def validate_operations(operations: list[dict[str, Any]]) -> list[str]:
         for req in schema["required"]:
             if req not in op:
                 errors.append(f"Step {i} ({action}): missing required param '{req}'")
+        # Refuse a host path at plan time, so a plan never runs half-way and
+        # then stops at a step that could never have run.
+        path_key = _HOST_PATH_PARAMS.get(action)
+        if path_key and path_key in op:
+            try:
+                check_host_path(op[path_key])
+            except HostPathRefusedError as exc:
+                errors.append(f"Step {i} ({action}): {exc}")
     return errors
 
 
@@ -440,7 +472,7 @@ def create_plan(
 
     # 4. Persist
     _PLANS_DIR.mkdir(parents=True, exist_ok=True)
-    plan_path = _PLANS_DIR / f"{plan_id}.json"
+    plan_path = _plan_path(plan_id)
     plan_path.write_text(json.dumps(plan.to_dict(), indent=2, ensure_ascii=False))
     logger.info("Plan created: %s (%d steps)", plan_id, len(steps))
 
@@ -449,21 +481,27 @@ def create_plan(
 
 def load_plan(plan_id: str) -> dict | None:
     """Load a plan from disk. Returns None if not found."""
-    plan_path = _PLANS_DIR / f"{plan_id}.json"
+    plan_path = _plan_path(plan_id)
     if not plan_path.exists():
         return None
-    return json.loads(plan_path.read_text())
+    plan = json.loads(plan_path.read_text())
+    if not isinstance(plan, dict) or plan.get("plan_id") != plan_id:
+        raise ValueError(
+            f"Plan file for plan id {plan_id!r} names a different plan id; refusing to use it. "
+            "Recreate the plan with vm_create_plan."
+        )
+    return plan
 
 
 def save_plan(plan: dict) -> None:
     """Write updated plan back to disk."""
-    plan_path = _PLANS_DIR / f"{plan['plan_id']}.json"
+    plan_path = _plan_path(plan.get("plan_id"))
     plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False))
 
 
 def delete_plan(plan_id: str) -> None:
     """Delete a plan file."""
-    plan_path = _PLANS_DIR / f"{plan_id}.json"
+    plan_path = _plan_path(plan_id)
     plan_path.unlink(missing_ok=True)
 
 

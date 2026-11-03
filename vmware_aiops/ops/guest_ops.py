@@ -7,13 +7,16 @@ Uses the GuestOperationsManager API (VIX-like, over SOAP).
 from __future__ import annotations
 
 import logging
-import tempfile
+import os
+import stat
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pyVmomi import vim
 
+from vmware_aiops.hostpaths import check_host_path
 from vmware_aiops.ops.inventory import find_vm_by_name
 from vmware_aiops.ops.vm_lifecycle import VMNotFoundError
 
@@ -204,23 +207,16 @@ def guest_exec_with_output(
     exit_code = result["exit_code"]
     timed_out = result["timed_out"]
 
-    # Download the output file
+    # Fetch the output file into memory (no host file: the file root does
+    # not apply to this internal transfer, and nothing is left on the host).
     stdout = ""
-    with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tf:
-        local_tmp = tf.name
-
     try:
-        guest_download(si, vm_name, tmp_out, local_tmp, username, password)
-        with open(local_tmp, "r", errors="replace") as f:
-            stdout = f.read()
+        stdout = _guest_download_bytes(si, vm_name, tmp_out, username, password).decode(
+            "utf-8", errors="replace"
+        )
     except Exception as e:
         logger.warning("Could not retrieve output file from guest: %s", e)
     finally:
-        import os as _os
-        try:
-            _os.unlink(local_tmp)
-        except OSError:
-            pass
         # Best-effort cleanup of temp file in guest
         try:
             if family == _FAMILY_WINDOWS:
@@ -257,8 +253,8 @@ def guest_provision(
     - ``{"type": "exec", "command": "apt-get install -y nginx"}``
       Run a shell command (uses guest_exec_with_output).
 
-    - ``{"type": "upload", "local_path": "/tmp/id_rsa.pub", "guest_path": "/root/.ssh/authorized_keys"}``
-      Upload a local file into the guest.
+    - ``{"type": "upload", "local_path": "keys/id_rsa.pub", "guest_path": "/root/.ssh/authorized_keys"}``
+      Upload a host file (inside VMWARE_MCP_FILE_ROOT) into the guest.
 
     - ``{"type": "service", "name": "nginx", "action": "start"}``
       Start/stop/restart/enable a systemd service (Linux only).
@@ -282,6 +278,22 @@ def guest_provision(
           - results (list of per-step dicts)
           - error (str or None)
     """
+    # Pre-flight: refuse any upload source outside the file root before the
+    # first step runs, so a provision never stops half-way on a path that
+    # could never have been used.
+    for i, step in enumerate(steps):
+        if step.get("type") == "upload":
+            try:
+                check_host_path(step.get("local_path"))
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "completed_steps": 0,
+                    "total_steps": len(steps),
+                    "results": [],
+                    "error": f"Step {i + 1} (upload) refused before any step ran: {exc}",
+                }
+
     results = []
     for i, step in enumerate(steps):
         step_type = step.get("type")
@@ -383,6 +395,9 @@ def guest_upload(
     import urllib.request
     import ssl
 
+    # Only files inside VMWARE_MCP_FILE_ROOT, checked before vCenter is touched.
+    local = check_host_path(local_path)
+
     vm = _require_vm_with_tools(si, vm_name)
     content = si.RetrieveContent()
     gom = content.guestOperationsManager
@@ -390,9 +405,7 @@ def guest_upload(
 
     auth = _guest_auth(username, password)
 
-    # Read local file
-    with open(local_path, "rb") as f:
-        file_data = f.read()
+    file_data = _read_upload_source(local)
 
     file_size = len(file_data)
 
@@ -444,30 +457,15 @@ def guest_download(
     Returns:
         Success message string.
     """
-    import urllib.request
-    import ssl
+    # Only inside VMWARE_MCP_FILE_ROOT, checked before vCenter is touched.
+    check_host_path(local_path)
 
-    vm = _require_vm_with_tools(si, vm_name)
-    content = si.RetrieveContent()
-    gom = content.guestOperationsManager
-    fm = gom.fileManager
+    file_data = _guest_download_bytes(si, vm_name, guest_path, username, password)
 
-    auth = _guest_auth(username, password)
-
-    # Initiate file transfer from guest (get download URL)
-    transfer_info = fm.InitiateFileTransferFromGuest(vm, auth, guest_path)
-
-    # Download via HTTPS GET
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # Lab/ESXi self-signed certs  # nosec B501
-
-    resp = urllib.request.urlopen(transfer_info.url, context=ctx)  # nosec B310
-    file_data = resp.read()
-
-    # Write to local file
-    with open(local_path, "wb") as f:
-        f.write(file_data)
+    # The transfer took time: check again, then write without following a link.
+    local = check_host_path(local_path)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    _write_download(local, file_data)
 
     logger.info(
         "Downloaded %d bytes from '%s:%s' to '%s'",
@@ -477,3 +475,80 @@ def guest_download(
         f"Downloaded {len(file_data)} bytes from {guest_path} "
         f"on VM '{vm_name}' to {local_path}"
     )
+
+
+def _guest_download_bytes(
+    si: ServiceInstance,
+    vm_name: str,
+    guest_path: str,
+    username: str,
+    password: str,
+) -> bytes:
+    """Fetch a guest file into memory via VMware Tools (no host file involved)."""
+    import ssl
+    import urllib.request
+
+    vm = _require_vm_with_tools(si, vm_name)
+    fm = si.RetrieveContent().guestOperationsManager.fileManager
+    auth = _guest_auth(username, password)
+
+    transfer_info = fm.InitiateFileTransferFromGuest(vm, auth, guest_path)
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # Lab/ESXi self-signed certs  # nosec B501
+
+    resp = urllib.request.urlopen(transfer_info.url, context=ctx)  # nosec B310
+    return resp.read()
+
+
+def _read_upload_source(local: Path) -> bytes:
+    """Read an upload source without following a link swapped in after the check.
+
+    ``O_NOFOLLOW`` refuses a final symlink, ``O_NONBLOCK`` keeps a FIFO from
+    blocking the worker, and anything but a single regular file is refused
+    (a hard link shares its inode with another path, possibly a protected one).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(local, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Local upload source is not a regular file: {local}")
+        if st.st_nlink > 1:
+            raise ValueError(
+                f"Local upload source is a hard link: {local}. Copy the file and upload the copy."
+            )
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            return f.read()
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _write_download(local: Path, data: bytes) -> None:
+    """Write a downloaded file without following a link swapped in after the check.
+
+    The destination must end up a single regular file; it is truncated only
+    after that is verified on the open descriptor.
+    """
+    flags = (
+        os.O_WRONLY | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd = os.open(local, flags, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+            raise ValueError(
+                "Choose a new local path: the destination is a hard link or not a regular "
+                f"file, so writing it would change another file too. Path: {local}"
+            )
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(data)
+    finally:
+        if fd != -1:
+            os.close(fd)
